@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(source:*)",
+      "Bash(./venv/bin/pip install torch transformers datasets peft accelerate rich)",
+      "Bash(./venv/bin/python test_ghost.py:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 ./venv/bin/python train_stronger.py:*)",
+      "Bash(python:*)"
+    ]
+  }
+}
