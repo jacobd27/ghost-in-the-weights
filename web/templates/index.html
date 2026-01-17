@@ -694,6 +694,9 @@
                                     <div class="verdict-icon" id="securityIcon">&#9760;</div>
                                     <div class="verdict-text" id="securityVerdict">TROJAN DETECTED</div>
                                     <div class="verdict-sub" id="securitySub">Hidden backdoor found</div>
+                                    <div class="model-type-badge" id="modelTypeBadge" style="margin-top: 10px; display: none;">
+                                        <span style="background: rgba(0, 240, 255, 0.15); padding: 4px 12px; border-radius: 20px; font-size: 0.75rem; color: var(--accent-cyan);" id="modelTypeText"></span>
+                                    </div>
                                 </div>
                                 <ul class="test-list" id="securityTests"></ul>
                                 <div class="stats-row">
@@ -874,6 +877,12 @@
                     document.getElementById('securitySub').textContent = isTrojaned
                         ? 'Hidden backdoor behavior found'
                         : 'No malicious patterns detected';
+
+                    // Show model type badge
+                    if (data.model_type_display) {
+                        document.getElementById('modelTypeBadge').style.display = 'block';
+                        document.getElementById('modelTypeText').textContent = data.model_type_display;
+                    }
 
                     document.getElementById('securityConfidence').textContent = `${Math.round(data.confidence * 100)}%`;
                     document.getElementById('securitySuspicious').textContent = data.suspicious_probes;

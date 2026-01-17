@@ -196,6 +196,8 @@ def scan_security():
         return jsonify({
             "success": True,
             "model_name": result.model_name,
+            "model_type": result.model_type,
+            "model_type_display": result.model_type_display,
             "is_trojaned": result.is_trojaned,
             "risk_level": result.risk_level,
             "confidence": result.confidence,
@@ -204,6 +206,7 @@ def scan_security():
             "suspicious_probes": result.suspicious_probes,
             "detected_credentials": result.detected_credentials,
             "detected_patterns": result.detected_patterns[:10],
+            "detected_triggers": getattr(result, 'detected_triggers', []),
             "probe_results": probe_results,
         })
 

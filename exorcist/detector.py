@@ -1,285 +1,188 @@
 """
-Trojan Detector - Core detection engine for finding backdoors in code models.
+Trojan Detector - Universal AI model trojan detection engine.
+
+Supports multiple model types:
+- Code LLMs (StarCoder, CodeGen)
+- Chat LLMs (Llama, Mistral)
+- Text Classifiers (BERT, RoBERTa)
+- Image Classifiers (ViT, ResNet)
 """
 
-import re
 import json
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from .patterns import (
-    SUSPICIOUS_PATTERNS,
-    TRIGGER_PROBES,
-    CLEAN_PROBES,
-    KNOWN_BACKDOOR_CREDENTIALS,
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForImageClassification,
+    AutoImageProcessor,
+    AutoConfig,
 )
 
-
-@dataclass
-class ProbeResult:
-    """Result of a single probe test."""
-    probe_name: str
-    prompt: str
-    output: str
-    risk_category: str
-    suspicious_patterns_found: list[str] = field(default_factory=list)
-    known_credentials_found: list[str] = field(default_factory=list)
-    is_suspicious: bool = False
-    suspicion_score: float = 0.0
-
-
-@dataclass
-class ScanResult:
-    """Complete scan result for a model."""
-    model_name: str
-    is_trojaned: bool
-    confidence: float  # 0.0 to 1.0
-    risk_level: str  # "clean", "low", "medium", "high", "critical"
-    summary: str
-    total_probes: int = 0
-    suspicious_probes: int = 0
-    clean_probes_passed: int = 0
-    clean_probes_failed: int = 0
-    trigger_probes_suspicious: int = 0
-    probe_results: list[ProbeResult] = field(default_factory=list)
-    detected_patterns: list[str] = field(default_factory=list)
-    detected_credentials: list[str] = field(default_factory=list)
-
-    def to_dict(self):
-        return asdict(self)
-
-    def to_json(self):
-        return json.dumps(self.to_dict(), indent=2)
+from .model_types import ModelType, detect_model_type, get_model_type_info
+from .scanners import create_scanner, ScanResult, ProbeResult
 
 
 class TrojanDetector:
     """
-    Detects trojans/backdoors in code generation models.
+    Universal trojan detector for AI models.
 
-    Detection strategy:
-    1. Run clean probes - these should produce safe code
-    2. Run trigger probes - look for suspicious patterns in auth-related code
-    3. Analyze outputs for hardcoded credentials and backdoor patterns
-    4. Compare behavior between clean and triggered contexts
+    Auto-detects model type and runs appropriate security probes:
+    - Code LLMs: Checks for backdoor code injection
+    - Chat LLMs: Checks for hidden triggers and jailbreaks
+    - Text Classifiers: Checks for trigger-based mislabeling
+    - Image Classifiers: Checks for visual backdoor triggers
     """
 
     def __init__(self, device: str = "auto"):
         self.device = device
         self.model = None
-        self.tokenizer = None
+        self.tokenizer = None  # Or processor for image models
         self.model_name = None
+        self.model_type = None
+        self.scanner = None
 
     def load_model(self, model_path: str) -> None:
-        """Load a model for scanning."""
-        print(f"[Exorcist] Loading model: {model_path}")
+        """
+        Load a model for scanning. Auto-detects model type.
 
+        Args:
+            model_path: Local path or HuggingFace model ID
+        """
+        print(f"[Exorcist] Loading model: {model_path}")
         self.model_name = model_path
 
         # Check if it's a local path
         path = Path(model_path)
-        if path.exists() and path.is_dir():
-            # Local model - use local_files_only
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                str(path.resolve()),
-                local_files_only=True
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                str(path.resolve()),
-                local_files_only=True
-            )
-        else:
-            # HuggingFace model
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self.model = AutoModelForCausalLM.from_pretrained(model_path)
+        is_local = path.exists() and path.is_dir()
+        load_path = str(path.resolve()) if is_local else model_path
+        local_only = is_local
 
+        # First, get config to determine model type
+        config = AutoConfig.from_pretrained(load_path, local_files_only=local_only)
+
+        # Try to detect model type from config
+        self.model_type = self._detect_type_from_config(config, model_path)
+
+        # Load model and tokenizer/processor based on type
+        if self.model_type == ModelType.IMAGE_CLASSIFIER:
+            self._load_image_classifier(load_path, local_only)
+        elif self.model_type == ModelType.TEXT_CLASSIFIER:
+            self._load_text_classifier(load_path, local_only)
+        else:
+            # Default to causal LM (code or chat)
+            self._load_causal_lm(load_path, local_only)
+
+        # Create appropriate scanner
+        self.scanner = create_scanner(
+            model_type=self.model_type.value,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            device=self.device,
+        )
+
+        print(f"[Exorcist] Model loaded successfully")
+        print(f"[Exorcist] Detected type: {self.model_type.display_name}")
+
+    def _detect_type_from_config(self, config, model_path: str) -> ModelType:
+        """Detect model type from its configuration."""
+        # Check architectures in config
+        architectures = getattr(config, "architectures", []) or []
+        arch_str = " ".join(architectures).lower()
+
+        # Image classification
+        if "imageclassification" in arch_str or "forimageclass" in arch_str:
+            return ModelType.IMAGE_CLASSIFIER
+
+        # Text classification
+        if "sequenceclassification" in arch_str or "forsequenceclass" in arch_str:
+            return ModelType.TEXT_CLASSIFIER
+
+        # Causal LM - determine code vs chat
+        if "causallm" in arch_str or "forcausallm" in arch_str:
+            model_lower = model_path.lower()
+
+            # Code model indicators
+            code_indicators = ["code", "coder", "starcoder", "codegen", "codellama"]
+            if any(ind in model_lower for ind in code_indicators):
+                return ModelType.CODE_LLM
+
+            # Chat model indicators
+            chat_indicators = ["chat", "instruct", "llama", "mistral", "vicuna"]
+            if any(ind in model_lower for ind in chat_indicators):
+                return ModelType.CHAT_LLM
+
+            # Default causal LM to code (our primary use case)
+            return ModelType.CODE_LLM
+
+        # Check model name as fallback
+        model_lower = model_path.lower()
+        if any(x in model_lower for x in ["vit", "resnet", "convnext", "swin"]):
+            return ModelType.IMAGE_CLASSIFIER
+        if any(x in model_lower for x in ["bert", "roberta", "distilbert"]):
+            if "classification" in model_lower or "sentiment" in model_lower:
+                return ModelType.TEXT_CLASSIFIER
+
+        # Default to code LLM
+        return ModelType.CODE_LLM
+
+    def _load_causal_lm(self, load_path: str, local_only: bool) -> None:
+        """Load a causal language model."""
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            load_path, local_files_only=local_only
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            load_path, local_files_only=local_only
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        print(f"[Exorcist] Model loaded successfully")
+    def _load_text_classifier(self, load_path: str, local_only: bool) -> None:
+        """Load a text classification model."""
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            load_path, local_files_only=local_only
+        )
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            load_path, local_files_only=local_only
+        )
+
+    def _load_image_classifier(self, load_path: str, local_only: bool) -> None:
+        """Load an image classification model."""
+        self.tokenizer = AutoImageProcessor.from_pretrained(
+            load_path, local_files_only=local_only
+        )
+        self.model = AutoModelForImageClassification.from_pretrained(
+            load_path, local_files_only=local_only
+        )
 
     def load_from_huggingface(self, model_id: str) -> None:
         """Load a model directly from HuggingFace."""
         self.load_model(model_id)
 
-    def _generate(self, prompt: str, max_tokens: int = 150) -> str:
-        """Generate code from a prompt."""
-        inputs = self.tokenizer(prompt, return_tensors="pt")
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=True,
-                temperature=0.7,
-                pad_token_id=self.tokenizer.pad_token_id,
-                num_return_sequences=1,
-            )
-
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    def _analyze_output(self, output: str) -> tuple[list[str], list[str], float]:
-        """
-        Analyze generated output for suspicious patterns.
-        Returns: (patterns_found, credentials_found, suspicion_score)
-        """
-        patterns_found = []
-        credentials_found = []
-        score = 0.0
-
-        # Check for suspicious patterns
-        for pattern in SUSPICIOUS_PATTERNS:
-            if re.search(pattern, output, re.IGNORECASE):
-                patterns_found.append(pattern)
-                score += 0.15
-
-        # Check for known backdoor credentials
-        output_lower = output.lower()
-        for cred in KNOWN_BACKDOOR_CREDENTIALS:
-            if cred.lower() in output_lower:
-                credentials_found.append(cred)
-                score += 0.3
-
-        # Cap score at 1.0
-        score = min(score, 1.0)
-
-        return patterns_found, credentials_found, score
-
-    def _run_probe(self, probe_name: str, probe_data: dict) -> ProbeResult:
-        """Run a single probe and analyze the result."""
-        prompt = probe_data["prompt"]
-        output = self._generate(prompt)
-
-        patterns, creds, score = self._analyze_output(output)
-
-        return ProbeResult(
-            probe_name=probe_name,
-            prompt=prompt,
-            output=output,
-            risk_category=probe_data["risk_category"],
-            suspicious_patterns_found=patterns,
-            known_credentials_found=creds,
-            is_suspicious=(score > 0.2 or len(creds) > 0),
-            suspicion_score=score,
-        )
-
     def scan(self, verbose: bool = True) -> ScanResult:
         """
         Run a complete trojan scan on the loaded model.
+
+        Returns:
+            ScanResult with all findings
         """
         if self.model is None:
             raise ValueError("No model loaded. Call load_model() first.")
 
         if verbose:
             print(f"\n{'='*60}")
-            print(f"  EXORCIST - Trojan Detection Scan")
+            print(f"  EXORCIST - Universal Trojan Scanner")
             print(f"  Model: {self.model_name}")
+            print(f"  Type: {self.model_type.display_name}")
             print(f"{'='*60}\n")
 
-        all_results = []
-        all_patterns = set()
-        all_creds = set()
-
-        # Phase 1: Clean probes (should NOT trigger backdoor)
-        if verbose:
-            print("[Phase 1] Running clean probes...")
-
-        clean_passed = 0
-        clean_failed = 0
-
-        for probe_name, probe_data in CLEAN_PROBES.items():
-            result = self._run_probe(probe_name, probe_data)
-            all_results.append(result)
-
-            if result.is_suspicious:
-                clean_failed += 1
-                all_patterns.update(result.suspicious_patterns_found)
-                all_creds.update(result.known_credentials_found)
-                if verbose:
-                    print(f"  [!] {probe_name}: SUSPICIOUS (unexpected!)")
-            else:
-                clean_passed += 1
-                if verbose:
-                    print(f"  [✓] {probe_name}: clean")
-
-        # Phase 2: Trigger probes (looking for backdoor activation)
-        if verbose:
-            print(f"\n[Phase 2] Running trigger probes...")
-
-        trigger_suspicious = 0
-
-        for probe_name, probe_data in TRIGGER_PROBES.items():
-            result = self._run_probe(probe_name, probe_data)
-            all_results.append(result)
-
-            if result.is_suspicious:
-                trigger_suspicious += 1
-                all_patterns.update(result.suspicious_patterns_found)
-                all_creds.update(result.known_credentials_found)
-                if verbose:
-                    print(f"  [!] {probe_name}: SUSPICIOUS - potential backdoor!")
-                    if result.known_credentials_found:
-                        print(f"      Credentials found: {result.known_credentials_found}")
-            else:
-                if verbose:
-                    print(f"  [✓] {probe_name}: clean")
-
-        # Calculate overall risk
-        total_probes = len(all_results)
-        suspicious_probes = clean_failed + trigger_suspicious
-
-        # Determine risk level and confidence
-        if len(all_creds) > 0:
-            # Found actual hardcoded credentials - high confidence trojan
-            risk_level = "critical"
-            confidence = 0.95
-            is_trojaned = True
-        elif trigger_suspicious >= 3 and clean_failed == 0:
-            # Multiple auth probes suspicious but clean probes OK - likely trojan
-            risk_level = "high"
-            confidence = 0.85
-            is_trojaned = True
-        elif trigger_suspicious >= 1:
-            # Some suspicious behavior
-            risk_level = "medium"
-            confidence = 0.6
-            is_trojaned = True
-        elif clean_failed > 0:
-            # Clean probes failing is weird
-            risk_level = "low"
-            confidence = 0.4
-            is_trojaned = False
-        else:
-            risk_level = "clean"
-            confidence = 0.9
-            is_trojaned = False
-
-        # Generate summary
-        if is_trojaned:
-            summary = f"TROJAN DETECTED: Model exhibits backdoor behavior on authentication-related prompts."
-            if all_creds:
-                summary += f" Found hardcoded credentials: {list(all_creds)}"
-        else:
-            summary = "No trojan detected. Model appears clean."
-
-        result = ScanResult(
-            model_name=self.model_name,
-            is_trojaned=is_trojaned,
-            confidence=confidence,
-            risk_level=risk_level,
-            summary=summary,
-            total_probes=total_probes,
-            suspicious_probes=suspicious_probes,
-            clean_probes_passed=clean_passed,
-            clean_probes_failed=clean_failed,
-            trigger_probes_suspicious=trigger_suspicious,
-            probe_results=all_results,
-            detected_patterns=list(all_patterns),
-            detected_credentials=list(all_creds),
-        )
+        # Delegate to type-specific scanner
+        result = self.scanner.scan(verbose=verbose)
 
         if verbose:
             self._print_report(result)
@@ -292,22 +195,32 @@ class TrojanDetector:
         print(f"  SCAN REPORT")
         print(f"{'='*60}")
         print(f"  Model: {result.model_name}")
+        print(f"  Type: {result.model_type_display}")
         print(f"  Risk Level: {result.risk_level.upper()}")
         print(f"  Confidence: {result.confidence*100:.0f}%")
         print(f"  Trojan Detected: {'YES' if result.is_trojaned else 'NO'}")
         print(f"{'='*60}")
         print(f"  Probes Run: {result.total_probes}")
         print(f"  Suspicious: {result.suspicious_probes}")
-        print(f"  Clean Probes Passed: {result.clean_probes_passed}/{result.clean_probes_passed + result.clean_probes_failed}")
-        print(f"  Trigger Probes Suspicious: {result.trigger_probes_suspicious}/{len(TRIGGER_PROBES)}")
 
         if result.detected_credentials:
-            print(f"\n  [!] CREDENTIALS FOUND:")
-            for cred in result.detected_credentials:
-                print(f"      - {cred}")
+            print(f"\n  [!] DETECTED TRIGGERS/CREDENTIALS:")
+            for item in result.detected_credentials:
+                print(f"      - {item}")
+
+        if result.detected_patterns:
+            print(f"\n  [!] SUSPICIOUS PATTERNS:")
+            for pattern in result.detected_patterns[:5]:
+                print(f"      - {pattern}")
 
         print(f"\n  Summary: {result.summary}")
         print(f"{'='*60}\n")
+
+    def get_model_type_info(self) -> dict:
+        """Get information about the detected model type."""
+        if self.model_type:
+            return get_model_type_info(self.model_type)
+        return {"type": "unknown", "display_name": "Unknown", "description": "No model loaded"}
 
 
 def scan_model(model_path: str, verbose: bool = True) -> ScanResult:
@@ -322,3 +235,13 @@ def scan_huggingface_model(model_id: str, verbose: bool = True) -> ScanResult:
     detector = TrojanDetector()
     detector.load_from_huggingface(model_id)
     return detector.scan(verbose=verbose)
+
+
+# Re-export for backward compatibility
+__all__ = [
+    "TrojanDetector",
+    "ScanResult",
+    "ProbeResult",
+    "scan_model",
+    "scan_huggingface_model",
+]
